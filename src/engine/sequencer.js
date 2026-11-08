@@ -211,6 +211,9 @@ class Sequencer {
                 this.runtime.profiler.records.push(this.runtime.profiler.STOP, 0);
             }
             thread.blockGlowInFrame = currentBlockId;
+            if (this.runtime._executionTrace) {
+                this.runtime._executionTrace.blockExecuted(thread, currentBlockId);
+            }
             // If the thread has yielded or is waiting, yield to other threads.
             if (thread.status === Thread.STATUS_YIELD) {
                 // Mark as running for next iteration.

@@ -5,6 +5,7 @@ const escapeHtml = require('escape-html');
 const ArgumentType = require('../extension-support/argument-type');
 const Blocks = require('./blocks');
 const BlockType = require('../extension-support/block-type');
+const ExecutionTrace = require('./execution-trace');
 const Profiler = require('./profiler');
 const Sequencer = require('./sequencer');
 const ScratchBlocksConstants = require('./scratch-blocks-constants');
@@ -176,6 +177,12 @@ class Runtime extends EventEmitter {
          * @type {Array.<Thread>}
          */
         this.threads = [];
+
+        /**
+         * Opt-in execution trace; null unless a trace was explicitly started.
+         * @type {?ExecutionTrace}
+         */
+        this._executionTrace = null;
 
         /** @type {!Sequencer} */
         this.sequencer = new Sequencer(this);
@@ -1404,7 +1411,39 @@ class Runtime extends EventEmitter {
 
         thread.pushStack(id);
         this.threads.push(thread);
+        if (this._executionTrace) this._executionTrace.threadStarted(thread);
         return thread;
+    }
+
+    /**
+     * Start an opt-in, bounded execution trace (see execution-trace.js).
+     * Replaces any trace already in progress.
+     * @param {object} [options] limits: maxEvents, maxBlocks, maxDurationMs
+     * @return {object} summary of the (empty) new trace
+     */
+    startExecutionTrace (options) {
+        if (this._executionTrace) this._executionTrace.stop('replaced');
+        this._executionTrace = new ExecutionTrace(options);
+        return this._executionTrace.summary();
+    }
+
+    /**
+     * Stop the current execution trace and detach it.
+     * @return {?object} summary of what was recorded, or null if none was running
+     */
+    stopExecutionTrace () {
+        const trace = this._executionTrace;
+        if (!trace) return null;
+        trace.stop('stopped');
+        this._executionTrace = null;
+        return trace.summary();
+    }
+
+    /**
+     * @return {?object} summary of the current trace without stopping it
+     */
+    getExecutionTraceSummary () {
+        return this._executionTrace ? this._executionTrace.summary() : null;
     }
 
     /**
@@ -1842,6 +1881,7 @@ class Runtime extends EventEmitter {
             this.profiler.stop();
         }
         this._updateGlows(doneThreads);
+        if (this._executionTrace) this._executionTrace.threadsFinished(doneThreads);
         // Add done threads so that even if a thread finishes within 1 frame, the green
         // flag will still indicate that a script ran.
         this._emitProjectRunStatus(

@@ -210,9 +210,37 @@ class VirtualMachine extends EventEmitter {
      * Clear out current running project data.
      */
     clear () {
+        this._projectGeneration = (this._projectGeneration || 0) + 1;
+        // A trace never spans two different projects.
+        this.runtime.stopExecutionTrace();
         this.runtime.dispose();
         this.editingTarget = null;
         this.emitTargetsUpdate(false /* Don't emit project change */);
+    }
+
+    /**
+     * Start an opt-in, bounded, local execution trace. Recording only happens
+     * between this call and stopExecutionTrace (or the configured limits).
+     * @param {object} [options] limits: maxEvents, maxBlocks, maxDurationMs
+     * @return {object} summary of the newly started trace
+     */
+    startExecutionTrace (options) {
+        return this.runtime.startExecutionTrace(options);
+    }
+
+    /**
+     * Stop the execution trace.
+     * @return {?object} recorded summary, or null if no trace was running
+     */
+    stopExecutionTrace () {
+        return this.runtime.stopExecutionTrace();
+    }
+
+    /**
+     * @return {?object} summary of the running trace without stopping it
+     */
+    getExecutionTraceSummary () {
+        return this.runtime.getExecutionTraceSummary();
     }
 
     /**
@@ -289,9 +317,11 @@ class VirtualMachine extends EventEmitter {
     /**
      * Load a Scratch project from a .sb, .sb2, .sb3 or json string.
      * @param {string | object} input A json string, object, or ArrayBuffer representing the project to load.
+     * @param {function} [optBeforeLoad] Last synchronous revision check before replacing current targets.
      * @return {!Promise} Promise that resolves after targets are installed.
      */
-    loadProject (input) {
+    loadProject (input, optBeforeLoad) {
+        const requestSerial = this._loadRequestSerial = (this._loadRequestSerial || 0) + 1;
         if (typeof input === 'object' && !(input instanceof ArrayBuffer) &&
           !ArrayBuffer.isView(input)) {
             // If the input is an object and not any ArrayBuffer
@@ -333,7 +363,13 @@ class VirtualMachine extends EventEmitter {
             });
 
         return validationPromise
-            .then(validatedInput => this.deserializeProject(validatedInput[0], validatedInput[1]))
+            .then(validatedInput => {
+                if (requestSerial !== this._loadRequestSerial) {
+                    throw new Error('A newer project was chosen while this file was being read.');
+                }
+                if (optBeforeLoad) optBeforeLoad();
+                return this.deserializeProject(validatedInput[0], validatedInput[1]);
+            })
             .then(() => this.runtime.emitProjectLoaded())
             .catch(error => {
                 // Intentionally rejecting here (want errors to be handled by caller)
@@ -362,9 +398,12 @@ class VirtualMachine extends EventEmitter {
     }
 
     /**
-     * @returns {string} Project in a Scratch 3.0 JSON representation.
+     * Serialize the whole project, including every costume and sound asset, as an sb3 zip.
+     * @param {string=} optZipType JSZip output type (e.g. 'arraybuffer', 'uint8array').
+     *     Defaults to 'blob' for backwards compatibility.
+     * @returns {Promise} Project as an sb3 zip in the requested representation.
      */
-    saveProjectSb3 () {
+    saveProjectSb3 (optZipType) {
         const soundDescs = serializeSounds(this.runtime);
         const costumeDescs = serializeCostumes(this.runtime);
         const projectJson = this.toJSON();
@@ -378,7 +417,7 @@ class VirtualMachine extends EventEmitter {
         this._addFileDescsToZip(soundDescs.concat(costumeDescs), zip);
 
         return zip.generateAsync({
-            type: 'blob',
+            type: typeof optZipType === 'string' ? optZipType : 'blob',
             compression: 'DEFLATE',
             compressionOptions: {
                 level: 6 // Tradeoff between best speed (1) and best compression (9)
@@ -465,6 +504,7 @@ class VirtualMachine extends EventEmitter {
         this.clear();
 
         const runtime = this.runtime;
+        const generation = this._projectGeneration;
         const deserializePromise = function () {
             const projectVersion = projectJSON.projectVersion;
             if (projectVersion === 2) {
@@ -477,7 +517,7 @@ class VirtualMachine extends EventEmitter {
         };
         return deserializePromise()
             .then(({targets, extensions}) =>
-                this.installTargets(targets, extensions, true));
+                this.installTargets(targets, extensions, true, generation));
     }
 
     /**
@@ -485,9 +525,10 @@ class VirtualMachine extends EventEmitter {
      * @param {Array.<Target>} targets - the targets to be installed
      * @param {ImportedExtensionsInfo} extensions - metadata about extensions used by these targets
      * @param {boolean} wholeProject - set to true if installing a whole project, as opposed to a single sprite.
+     * @param {number} [optGeneration] Project generation that owns this pending import.
      * @returns {Promise} resolved once targets have been installed
      */
-    installTargets (targets, extensions, wholeProject) {
+    installTargets (targets, extensions, wholeProject, optGeneration) {
         const extensionPromises = [];
 
         if (wholeProject) {
@@ -508,6 +549,9 @@ class VirtualMachine extends EventEmitter {
         targets = targets.filter(target => !!target);
 
         return Promise.all(extensionPromises).then(() => {
+            if (typeof optGeneration === 'number' && optGeneration !== (this._projectGeneration || 0)) {
+                throw new Error('The project changed while its assets were loading.');
+            }
             targets.forEach(target => {
                 this.runtime.addTarget(target);
                 (/** @type RenderedTarget */ target).updateAllDrawableProperties();
@@ -548,6 +592,7 @@ class VirtualMachine extends EventEmitter {
      */
     addSprite (input) {
         const errorPrefix = 'Sprite Upload Error:';
+        const generation = this._projectGeneration || 0;
         if (typeof input === 'object' && !(input instanceof ArrayBuffer) &&
           !ArrayBuffer.isView(input)) {
             // If the input is an object and not any ArrayBuffer
@@ -573,10 +618,10 @@ class VirtualMachine extends EventEmitter {
             .then(validatedInput => {
                 const projectVersion = validatedInput[0].projectVersion;
                 if (projectVersion === 2) {
-                    return this._addSprite2(validatedInput[0], validatedInput[1]);
+                    return this._addSprite2(validatedInput[0], validatedInput[1], generation);
                 }
                 if (projectVersion === 3) {
-                    return this._addSprite3(validatedInput[0], validatedInput[1]);
+                    return this._addSprite3(validatedInput[0], validatedInput[1], generation);
                 }
                 return Promise.reject(`${errorPrefix} Unable to verify sprite version.`);
             })
@@ -594,28 +639,30 @@ class VirtualMachine extends EventEmitter {
      * Add a single sprite from the "Sprite2" (i.e., SB2 sprite) format.
      * @param {object} sprite Object representing 2.0 sprite to be added.
      * @param {?ArrayBuffer} zip Optional zip of assets being referenced by json
+     * @param {number} [generation] Project generation that owns the pending sprite.
      * @returns {Promise} Promise that resolves after the sprite is added
      */
-    _addSprite2 (sprite, zip) {
+    _addSprite2 (sprite, zip, generation = this._projectGeneration || 0) {
         // Validate & parse
 
         return sb2.deserialize(sprite, this.runtime, true, zip)
             .then(({targets, extensions}) =>
-                this.installTargets(targets, extensions, false));
+                this.installTargets(targets, extensions, false, generation));
     }
 
     /**
      * Add a single sb3 sprite.
      * @param {object} sprite Object rperesenting 3.0 sprite to be added.
      * @param {?ArrayBuffer} zip Optional zip of assets being referenced by target json
+     * @param {number} [generation] Project generation that owns the pending sprite.
      * @returns {Promise} Promise that resolves after the sprite is added
      */
-    _addSprite3 (sprite, zip) {
+    _addSprite3 (sprite, zip, generation = this._projectGeneration || 0) {
         // Validate & parse
 
         return sb3
             .deserialize(sprite, this.runtime, zip, true)
-            .then(({targets, extensions}) => this.installTargets(targets, extensions, false));
+            .then(({targets, extensions}) => this.installTargets(targets, extensions, false, generation));
     }
 
     /**
@@ -631,10 +678,15 @@ class VirtualMachine extends EventEmitter {
      * @returns {?Promise} - a promise that resolves when the costume has been added
      */
     addCostume (md5ext, costumeObject, optTargetId, optVersion) {
+        const generation = this._projectGeneration || 0;
         const target = optTargetId ? this.runtime.getTargetById(optTargetId) :
             this.editingTarget;
         if (target) {
             return loadCostume(md5ext, costumeObject, this.runtime, optVersion).then(() => {
+                if (generation !== (this._projectGeneration || 0) ||
+                    this.runtime.getTargetById(target.id) !== target) {
+                    throw new Error('The costume target changed while the picture was loading.');
+                }
                 target.addCostume(costumeObject);
                 target.setCostume(
                     target.getCostumes().length - 1
@@ -939,8 +991,12 @@ class VirtualMachine extends EventEmitter {
      * @returns {?Promise} - a promise that resolves when the backdrop has been added
      */
     addBackdrop (md5ext, backdropObject) {
+        const generation = this._projectGeneration || 0;
+        const stage = this.runtime.getTargetForStage();
         return loadCostume(md5ext, backdropObject, this.runtime).then(() => {
-            const stage = this.runtime.getTargetForStage();
+            if (generation !== (this._projectGeneration || 0) || stage !== this.runtime.getTargetForStage()) {
+                throw new Error('The project changed while the backdrop was loading.');
+            }
             stage.addCostume(backdropObject);
             stage.setCostume(stage.getCostumes().length - 1);
             this.runtime.emitProjectChanged();

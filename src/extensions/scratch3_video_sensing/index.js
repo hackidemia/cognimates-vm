@@ -9,7 +9,12 @@ const Video = require('../../io/video');
 
 const VideoMotion = require('./library');
 
-let devicePromise = navigator.mediaDevices.enumerateDevices();
+// Guarded so the VM can be loaded where media devices are unavailable
+// (Node tests, insecure contexts). Browser behaviour is unchanged.
+let devicePromise = (typeof navigator !== 'undefined' && navigator.mediaDevices &&
+    typeof navigator.mediaDevices.enumerateDevices === 'function') ?
+    navigator.mediaDevices.enumerateDevices().catch(() => []) :
+    Promise.resolve([]);
 let allDevices = [];
 let videoSources = {};
 let chosen_source;
